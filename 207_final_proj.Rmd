@@ -1,0 +1,774 @@
+---
+title: "STA207 Final Project"
+author: "Yichu Chen"
+date: "3/16/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE)
+library(lme4)
+library(gplots)
+library(ggplot2)
+library(lmerTest)
+library(MASS)
+library(ggpubr)
+library(papeR)
+library(qwraps2)
+options(qwraps2_markup ="markdown")
+library(scico)
+library(dplyr)
+library(pROC)
+library(xgboost)
+library(rpart)
+# library(rpart.plot)
+```
+
+```{r echo=FALSE}
+session=list()
+for(i in 1:5){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+  # print(session[[i]]$mouse_name)
+  # print(session[[i]]$date_exp)
+  
+}
+```
+
+```{r echo=FALSE, eval=FALSE}
+# Rename eval=TRUE if you want the output to appear in the report.
+# Take the 11th trial in Session 1 for example
+id=11
+session[[1]]$feedback_type[id]
+session[[1]]$contrast_left[id]
+session[[1]]$contrast_right[id]
+length(session[[1]]$time[[id]])
+dim(session[[1]]$spks[[id]])
+dim(session[[2]]$spks[[id]])
+dim(session[[3]]$spks[[id]])
+dim(session[[4]]$spks[[id]])
+dim(session[[5]]$spks[[id]])
+```
+# Abstraact
+
+In this report, we conduct data analysis based on experimental data that recorded mice's neural activity during visual discrimination tasks. Specifically, we aim to model the relationship between neuron's mean firing rate and the level of the given visual contrast (left and right). We begin by visual examination of our dataset and explore the trends and patterns of variation underlying the neurons in each session and at different contrast levels. To find out whether the effects of left and right contrasts are additive, we conducted hypothesis tests based on type-III ANOVA. At last, we use the dataset to build a model to possibly predict the outcome of a mouse's response (success/failure) during each trial. We also discussed several issues and interesting findings that may worth further attention in the last section.
+
+
+# Introduction
+
+In a human brain, the visual cortex is located in the occipital lobe and is primarily responsible for processing visual information with active engagement of multiple layers of neurons. A similar cortical structure can be found in the mouse brain, which essentially serves the same function. Very commonly, the visual cortex works concurrently with other parts of the brain to address complex tasks. It is of specific interest to study how the neurons in the visual cortex respond to input signals during the process of information acquisition and decision-making. In a previous study, researchers conducted experiments on a group of mice to study the distribution of choice, action and engagement encoding in the mouse brain (Steinmetz et. al, 2019). They recorded the mouse brain's neural activities during the engagement of a series of visual discrimination tasks. The original sample encompassed approximately 30,000 neurons in 42 mouse brain regions. In this project, we only focus on the neural activities in the visual cortex. Our goal is to model the relationship between the level of visual stimuli and the corresponding response of neurons in the visual cortex based on the experimental data.
+
+### Experiment Background
+The complete experiment comprises a total of 9,538 trials conducted in 39 separate sessions on 10 mice. In each session, two or three Neuropixels probes were installed at random locations in the left hemisphere to monitor the neuron firings over time. In each trial, a mouse was randomly assigned a combination of visual stimuli from the left and right side of the screen simultaneously, and was motivated to turn a wheel with their forepaws to pick the side with the highest contrast. A reward was given if the mouse turned the wheel to indicate the side with higher contrast, or proceeded with no action when the contrasts are equal on both sides (including no stimuli). A penalty was given otherwise. On each side of the screen, one of the four contrast levels (0, 0.25, 0.5, 1) was randomly assigned. After the onset of visual stimuli, there was a random delay interval of 0.5-1.2 seconds during which the mouse could turn the wheel without receiving penalty or reward. After that, the mice would hear an auditory tone cue and had 1.5 seconds to respond. No reward would be given after the 1.5-second window.
+
+### Dataset
+In this project, our analysis is based on only the neuron spikes in the visual cortex from the onset of stimuli to 0.4 seconds after the onset. This period was referred to as the analysis window and does not involve any reward or penalty. In addition, we use data from 1196 trials (with no missing data) from 5 sessions and 2 mice named Cori and Frossman. In particular, session 1-3 were conducted with Cori and session 4-5 were conducted with Frossman. All of the five sessions were conducted at different dates. Additionally, with changing locations of Neuropixels probes, the number of neurons and the types of neurons involved can differ across all 5 sessions, although it is still likely that some neurons were measured at multiple sessions.
+
+
+```{r}
+# import data
+raw.data = data.frame()
+
+for (id in 1:5){
+  session.data = session[[id]]
+  session.data$mean_spk = sapply(session.data$spks, mean)*39/0.4
+  session.data = data.frame(session.data[c("contrast_left", "contrast_right","mouse_name","date_exp","mean_spk")])
+  session.data$id = id
+  session.data$num_neuron = dim(session[[id]]$spks[[1]])[1]
+  raw.data = rbind(raw.data, session.data)
+}
+
+# convert to factor
+raw.data$contrast_left = as.factor(raw.data$contrast_left)
+raw.data$contrast_right = as.factor(raw.data$contrast_right)
+raw.data$id = as.factor(raw.data$id)
+```
+
+# Descriptive Analysis
+
+To quantify the overall neural activity in each trial, we use the mean firing rate per second across all the neurons, which we denote as the mean firing rate for simplicity. The key advantage of using mean firing rate is that it takes into account all sampled neurons, and thus offers a more comprehensive view of the overall level of neural activity than using sample quantiles. The implicit assumption here is that all neurons respond specifically to the visual stimuli. In the latter section, we will propose a possible alternative to using mean firing rate if this assumption is not valid.
+
+### Summary Table
+
+The summary statistics of mean firing rate at each level of left and right contrast along with the corresponding sample size of each contrast level are given below. In particular, we see that the data is imbalanced, with disproportionately larger sample size for 0 contrast (on both left and right). No major difference is present in terms of the variation of mean firing rate for each contrast level. We also presented the number of neurons involved in each session. It's worth the attention that session 2 measured over 500 neurons, which is much more tha other other sessions.
+
+```{r, results='asis'}
+group.contr.left = raw.data %>% dplyr::group_by(contrast_left) 
+group.contr.right = raw.data %>% dplyr::group_by(contrast_right) 
+group.id = raw.data %>% dplyr::group_by(id) 
+
+df_summary <-
+  list("mean firing rate" =
+       list("min"       = ~ round(min(mean_spk),3),
+            "25th"      = ~ round(quantile(mean_spk, 0.25),3),
+            "median"    = ~ round(median(mean_spk),3),
+            "75th"      = ~ round(quantile(mean_spk, 0.75),3),
+            "max"       = ~ round(max(mean_spk),3),
+            "mean (sd)" = ~ qwraps2::mean_sd(mean_spk)
+       ))
+
+df_summary2 <-
+  list("mean firing rate" =
+       list("num. neurons" = ~ median(num_neuron),
+            "mean (sd)" = ~ qwraps2::mean_sd(mean_spk)
+       ))
+
+
+d = summary_table(group.contr.left, df_summary)
+d2 = summary_table(group.contr.right, df_summary)
+d3 = summary_table(group.id, df_summary2)
+
+print(d, rtitle="Left Contrast")
+print(d2, rtitle="Right Contrast")
+print(d3, rtitle="ID")
+```
+
+#### Mean Firing Rate vs. Session ID
+
+```{r, fig.width=16, fig.height=6}
+# plot mean spike
+means.left = aggregate(mean_spk ~ id + contrast_left, data=raw.data, mean)
+means.left$se = 0
+means.right = aggregate(mean_spk ~ id + contrast_right, data=raw.data, mean)
+means.right$se = 0
+
+for (contr in c(0, 0.25, 0.5, 1)){
+  for (id in c(1,2,3,4,5)){
+    sub_df = raw.data[raw.data$id==id & raw.data$contrast_left==contr,]
+    n = dim(sub_df)[1]
+    means.left[means.left$id==id & means.left$contrast_left==contr,]$se = sd(sub_df$mean_spk)/sqrt(n)
+  }
+}
+for (contr in c(0, 0.25, 0.5, 1)){
+  for (id in c(1,2,3,4,5)){
+    sub_df = raw.data[raw.data$id==id & raw.data$contrast_right==contr,]
+    n = dim(sub_df)[1]
+    means.right[means.right$id==id & means.right$contrast_right==contr,]$se = sd(sub_df$mean_spk)/sqrt(n)
+  }
+}
+
+left_plot = ggplot(means.left, aes(x = contrast_left, y = mean_spk, group = id, col = id)) + theme_bw() + 
+  geom_line() + geom_point() + geom_ribbon(aes(contrast_left, ymax=mean_spk + 1.96*se, ymin=mean_spk - 1.96*se, fill=id), alpha=0.5, linetype=0) + labs(x="Left Contrast", y="Mean Firing Rate")
+
+
+right_plot = ggplot(means.right, aes(x = contrast_right, y = mean_spk, group = id, col = id)) + theme_bw() + 
+  geom_line() + geom_point() + geom_ribbon(aes(contrast_right, ymax=mean_spk + 1.96*se, ymin=mean_spk - 1.96*se, fill=id), alpha=0.5, linetype=0) + labs(x="Right Contrast", y=" ")
+
+plot = ggarrange(
+  left_plot, right_plot,
+  common.legend = TRUE, legend = "bottom")
+annotate_figure(plot, top = text_grob("Fig 1: Mean Firing Rate at Different Sessions", size = 14))
+
+```
+
+The overall trend of mean firing rate at each session is shown above (Fig 2). In terms of vertical distance, we noticed that curves from session 1-3 are almost adjacent with some overlaps in 95% confidence intervals; curves from session 4-5 are relatively close to each other, but with no overlap based on 95% confidence intervals. The "two-group" structure indicates the within-subject similarity, and underscores the between-subject difference. To be more specific in our context, the mouse Cori seems to have higher mean firing rate in response to the visual stimuli than Frossman. In addition, with the knowledge that session 2, followed by session 3, were conducted latter than session 1; and session 5 was conducted latter than session 4, we conclude that the overall neural activity of the two subjects tend to decrease overtime as more sessions were conducted. By also comparing the curves between different left and right contrast levels, we find no obvious difference in terms of the mean firing rate across all contrast levels. We do notice, however, some distinct patterns. For instance, when left contrast increase from 0.25 to 1, the mean firing rate constantly increases; when right contrast increases from 0.25 to 1, the mean firing rate acted reversely.
+
+### Mean Firing Rate vs. Contrast Level
+
+```{r}
+
+grid.weight <- function(s){
+  sub = session[[s]]
+  out.matrix = matrix(rep(0, 16), nrow=4)
+  c = c(0, 0.25, 0.5, 1)
+  for (i in 1:4){
+    for (j in 1:4){
+
+      n_ij <- length(sub$feedback_type[which(sub$contrast_left==c[i] & sub$contrast_right==c[j])])
+      out.matrix[i,j] = n_ij
+    }
+  }
+  return(sum(out.matrix)/out.matrix)
+}
+
+n = c(length(session[[1]]$contrast_left), length(session[[2]]$contrast_left),
+      length(session[[3]]$contrast_left), length(session[[4]]$contrast_left), length(session[[5]]$contrast_left))
+N = sum(n)
+
+
+left.list = list()
+right.list = list()
+
+left.list$l00 =rep(0, 39)
+left.list$l25 = rep(0, 39)
+left.list$l50 = rep(0, 39)
+left.list$l100 = rep(0, 39)
+
+right.list$r00 =rep(0, 39)
+right.list$r25 = rep(0, 39)
+right.list$r50 = rep(0, 39)
+right.list$r100 = rep(0, 39)
+
+for (s in 1:5){
+  weight.matrix = grid.weight(s)
+  for (i in 1:n[s]){
+    added = (1/N)*colMeans(session[[s]]$spks[[i]])
+  # left
+  if (session[[s]]$contrast_left[i] == 0 && session[[s]]$contrast_right[i] == 0){left.list$l00 = left.list$l00 + added*weight.matrix[1,1]}
+  if (session[[s]]$contrast_left[i] == 0.25 && session[[s]]$contrast_right[i] == 0){left.list$l25 = left.list$l25 + added*weight.matrix[1,2]}
+  if (session[[s]]$contrast_left[i] == 0.5 && session[[s]]$contrast_right[i] == 0){left.list$l50 = left.list$l50 + added*weight.matrix[1,3]}
+  if (session[[s]]$contrast_left[i] == 1 && session[[s]]$contrast_right[i] == 0){left.list$l100 = left.list$l100 + added*weight.matrix[1,4]}
+  
+  # right
+  if (session[[s]]$contrast_right[i] == 0 && session[[s]]$contrast_left[i] == 0){right.list$r00 = right.list$r00 + added*weight.matrix[1,1]}
+  if (session[[s]]$contrast_right[i] == 0.25 && session[[s]]$contrast_left[i] == 0){right.list$r25 = right.list$r25 + added*weight.matrix[2,1]}
+  if (session[[s]]$contrast_right[i] == 0.5 && session[[s]]$contrast_left[i] == 0){right.list$r50 = right.list$r50 + added*weight.matrix[3,1]}
+  if (session[[s]]$contrast_right[i] == 1 && session[[s]]$contrast_left[i] == 0){right.list$r100 = right.list$r100 + added*weight.matrix[4,1]}
+}}
+
+
+df.left  = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(left.list$l00, left.list$l25, left.list$l50, left.list$l100)
+)
+
+df.right = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(right.list$r00, right.list$r25, right.list$r50, right.list$r100)
+)
+
+left_plot1 = ggplot(data = df.left, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Left Contrast (Right=0)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+right_plot1 = ggplot(data = df.right, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Right Contrast (Left=0)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+# plot = ggarrange(
+#   left_plot1, right_plot1,
+#   common.legend = TRUE, legend = "right")
+# annotate_figure(plot, top = text_grob("Contrast vs. mean firing rate", size = 14))
+
+left.list = list()
+right.list = list()
+
+left.list$l00 =rep(0, 39)
+left.list$l25 = rep(0, 39)
+left.list$l50 = rep(0, 39)
+left.list$l100 = rep(0, 39)
+
+right.list$r00 =rep(0, 39)
+right.list$r25 = rep(0, 39)
+right.list$r50 = rep(0, 39)
+right.list$r100 = rep(0, 39)
+
+for (s in 1:5){
+  weight.matrix = grid.weight(s)
+  for (i in 1:n[s]){
+    added = (1/N)*colMeans(session[[s]]$spks[[i]])
+  # left
+  if (session[[s]]$contrast_left[i] == 0 && session[[s]]$contrast_right[i] == 0.25){left.list$l00 = left.list$l00 + added*weight.matrix[1,2]}
+  if (session[[s]]$contrast_left[i] == 0.25 && session[[s]]$contrast_right[i] == 0.25){left.list$l25 = left.list$l25 + added*weight.matrix[2,2]}
+  if (session[[s]]$contrast_left[i] == 0.5 && session[[s]]$contrast_right[i] == 0.25){left.list$l50 = left.list$l50 + added*weight.matrix[3,2]}
+  if (session[[s]]$contrast_left[i] == 1 && session[[s]]$contrast_right[i] == 0.25){left.list$l100 = left.list$l100 + added*weight.matrix[4,2]}
+  
+  # right
+  if (session[[s]]$contrast_right[i] == 0 && session[[s]]$contrast_left[i] == 0.25){right.list$r00 = right.list$r00 + added*weight.matrix[2,1]}
+  if (session[[s]]$contrast_right[i] == 0.25 && session[[s]]$contrast_left[i] == 0.25){right.list$r25 = right.list$r25 + added*weight.matrix[2,2]}
+  if (session[[s]]$contrast_right[i] == 0.5 && session[[s]]$contrast_left[i] == 0.25){right.list$r50 = right.list$r50 + added*weight.matrix[2,3]}
+  if (session[[s]]$contrast_right[i] == 1 && session[[s]]$contrast_left[i] == 0.25){right.list$r100 = right.list$r100 + added*weight.matrix[2,4]}
+}}
+
+
+df.left  = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(left.list$l00, left.list$l25, left.list$l50, left.list$l100)
+)
+
+df.right = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(right.list$r00, right.list$r25, right.list$r50, right.list$r100)
+)
+
+left_plot2 = ggplot(data = df.left, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Left Contrast (Right=0.25)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+right_plot2 = ggplot(data = df.right, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Right Contrast (Left=0.25)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+
+# plot = ggarrange(
+#   left_plot2, right_plot2,
+#   common.legend = TRUE, legend = "right")
+# annotate_figure(plot, top = text_grob("Contrast vs. mean firing rate", size = 14))
+
+
+left.list = list()
+right.list = list()
+
+left.list$l00 =rep(0, 39)
+left.list$l25 = rep(0, 39)
+left.list$l50 = rep(0, 39)
+left.list$l100 = rep(0, 39)
+
+right.list$r00 =rep(0, 39)
+right.list$r25 = rep(0, 39)
+right.list$r50 = rep(0, 39)
+right.list$r100 = rep(0, 39)
+
+for (s in 1:5){
+  weight.matrix = grid.weight(s)
+  for (i in 1:n[s]){
+    added = (1/N)*colMeans(session[[s]]$spks[[i]])
+  # left
+  if (session[[s]]$contrast_left[i] == 0 && session[[s]]$contrast_right[i] == 0.5){left.list$l00 = left.list$l00 + added*weight.matrix[1,3]}
+  if (session[[s]]$contrast_left[i] == 0.25 && session[[s]]$contrast_right[i] == 0.5){left.list$l25 = left.list$l25 + added*weight.matrix[2,3]}
+  if (session[[s]]$contrast_left[i] == 0.5 && session[[s]]$contrast_right[i] == 0.5){left.list$l50 = left.list$l50 + added*weight.matrix[3,3]}
+  if (session[[s]]$contrast_left[i] == 1 && session[[s]]$contrast_right[i] == 0.5){left.list$l100 = left.list$l100 + added*weight.matrix[4,3]}
+  
+  # right
+  if (session[[s]]$contrast_right[i] == 0 && session[[s]]$contrast_left[i] == 0.5){right.list$r00 = right.list$r00 + added*weight.matrix[3,1]}
+  if (session[[s]]$contrast_right[i] == 0.25 && session[[s]]$contrast_left[i] == 0.5){right.list$r25 = right.list$r25 + added*weight.matrix[3,2]}
+  if (session[[s]]$contrast_right[i] == 0.5 && session[[s]]$contrast_left[i] == 0.5){right.list$r50 = right.list$r50 + added*weight.matrix[3,3]}
+  if (session[[s]]$contrast_right[i] == 1 && session[[s]]$contrast_left[i] == 0.5){right.list$r100 = right.list$r100 + added*weight.matrix[3,4]}
+}}
+
+
+df.left  = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(left.list$l00, left.list$l25, left.list$l50, left.list$l100)
+)
+
+df.right = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(right.list$r00, right.list$r25, right.list$r50, right.list$r100)
+)
+
+left_plot3 = ggplot(data = df.left, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Left Contrast (Right=0.5)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+right_plot3 = ggplot(data = df.right, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Right Contrast (Left=0.5)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+# plot = ggarrange(
+#   left_plot3, right_plot3,
+#   common.legend = TRUE, legend = "right")
+# annotate_figure(plot, top = text_grob("Contrast vs. mean firing rate", size = 14))
+
+left.list = list()
+right.list = list()
+
+left.list$l00 =rep(0, 39)
+left.list$l25 = rep(0, 39)
+left.list$l50 = rep(0, 39)
+left.list$l100 = rep(0, 39)
+
+right.list$r00 =rep(0, 39)
+right.list$r25 = rep(0, 39)
+right.list$r50 = rep(0, 39)
+right.list$r100 = rep(0, 39)
+
+for (s in 1:5){
+  weight.matrix = grid.weight(s)
+  for (i in 1:n[s]){
+    added = (1/N)*colMeans(session[[s]]$spks[[i]])
+    
+  # left
+  if (session[[s]]$contrast_left[i] == 0 && session[[s]]$contrast_right[i] == 1){
+    left.list$l00 = left.list$l00 + added*weight.matrix[1,4]
+  }
+  if (session[[s]]$contrast_left[i] == 0.25 && session[[s]]$contrast_right[i] == 1){left.list$l25 = left.list$l25 + added*weight.matrix[2,4]}
+  if (session[[s]]$contrast_left[i] == 0.5 && session[[s]]$contrast_right[i] == 1){left.list$l50 = left.list$l50 + added*weight.matrix[3,4]}
+  if (session[[s]]$contrast_left[i] == 1 && session[[s]]$contrast_right[i] == 1){left.list$l100 = left.list$l100 + added*weight.matrix[4,4]}
+  
+  # right
+  if (session[[s]]$contrast_right[i] == 0 && session[[s]]$contrast_left[i] == 1){right.list$r00 = right.list$r00 + added*weight.matrix[4,1]}
+  if (session[[s]]$contrast_right[i] == 0.25 && session[[s]]$contrast_left[i] == 1){right.list$r25 = right.list$r25 + added*weight.matrix[4,2]}
+  if (session[[s]]$contrast_right[i] == 0.5 && session[[s]]$contrast_left[i] == 1){right.list$r50 = right.list$r50 + added*weight.matrix[4,3]}
+  if (session[[s]]$contrast_right[i] == 1 && session[[s]]$contrast_left[i] == 1){right.list$r100 = right.list$r100 + added*weight.matrix[4,4]}
+}}
+
+
+df.left  = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(left.list$l00, left.list$l25, left.list$l50, left.list$l100)
+)
+
+df.right = data.frame(
+  t = rep(c(1:39),4),
+  contrast = c(rep(0,39), rep(0.25, 39), rep(0.5, 39), rep(1,39)),
+  spk = c(right.list$r00, right.list$r25, right.list$r50, right.list$r100)
+)
+
+left_plot4 = ggplot(data = df.left, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Left Contrast (Right=1)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+right_plot4 = ggplot(data = df.right, aes(x=t/100, y=spk, color=contrast)) + geom_point(stat = "identity", alpha=0.3) + geom_smooth(aes(group=contrast), method = "loess", span=0.5, formula=y~x, se=FALSE) +scico::scale_color_scico(palette = "lajolla", breaks = c(0,0.25,0.5,1), begin=0.3, end=1, direction=1) + labs(color="Contrast", x="Time (sec)", y="Mean Firing Rate") + ggtitle("Right Contrast (Left=1)") + theme(plot.title = element_text(hjust = 0.5, size=10))
+
+
+# plot = ggarrange(
+#   left_plot4, right_plot4,
+#   common.legend = TRUE, legend = "right")
+# annotate_figure(plot, top = text_grob("Contrast vs. mean firing rate", size = 14))
+```
+
+```{r, fig.width=16, fig.height=6}
+plot = ggarrange(
+  left_plot1, left_plot2+rremove("xlab")+rremove("ylab"), right_plot1+rremove("xlab")+rremove("ylab"), right_plot2+rremove("xlab")+rremove("ylab"),
+  left_plot3, left_plot4+rremove("ylab"), right_plot3+rremove("ylab"), right_plot4+rremove("ylab"),
+  common.legend = TRUE, legend = "right", ncol=4, nrow=2)
+annotate_figure(plot, top = text_grob("Fig 2: Contrast vs. Mean Firing Rate", size = 14))
+```
+
+We further visualize (Fig 2) the mean firing rate over time at all possible combinations of left and right contrast levels. The time-varying mean firing rate complemented with the scatterplot smoother curves for each contrast combination are provided above. Darker color represents higher contrast and vice versa. In each subplot, the contrast level at one side varies with fixed level on the other side. To begin with, there is a shared pattern, such that the mean firing rate of neurons tends to increase over time from 0 to 0.4 seconds, upon the perception of visual stimuli. On top of that, one may further notice the prominence of the two local ridges, one peaks at around 0.1 second and the other slightly before 0.3 second. Such pattern persists at nearly all non-zero contrast levels, and becomes weaker when 0 contrast is present on either side. Oddly, the curve when contrasts at both sides are 0 is flat and does not vary over time. By comparing vertically, one would surprisingly notice that the black curves (corresponding to contrast at 1) do not always sit at the very top. While the dominance of black curves are obvious based on the 4 subplots on the right, it is not at all clear how the mean firing rate respond to different left contrasts levels with any fixed right contrast (based on plots on the left). The finding also shed light on the possible interactions between the effect of left and right contrasts on mean firing rate. By examining the difference in left and right contrast levels, one may also find that higher difference in contrast do not necessarily lead to higher mean firing rate. For example, when left contrast at 0, the magnitude of mean firing rate is nearly identical when the right contrast is respectively 0.25 and 1.
+
+
+# Inferential Analysis
+
+We proceed with a 2-way ANOVA with mixed effect to model the relationship between left and right contrast and mean neuron firing rate. We use mean firing rate as the response, left contrast and right contrast as fixed effects. In addition, we treat session ID as random intercept, owing to the fact that neurons involved in each session are not fixed and only represent a small proportion of all neurons in the entire visual cortex. In addition, the dates and the subject may also vary across different sessions. Although we are not interested in the between-session difference in mean firing rate, we still need to model the random effect of session ID to safely account for those extra variability. The goal of our analysis in this section is to identify whether higher left or right contrast levels leads to significant increases in neural activities in the visual cortex. In addition, we also want to know whether the effects of left and right contrasts, if exist, are additive (i.e. whether or not interaction exists).
+
+### Model
+
+The proposed model has the following form:
+
+$$
+Y_{ijk(r)} = \mu_{(r)} + \alpha_i +\beta_j +(\alpha\beta)_{ij} +\epsilon_{ijk} \hspace{0.3cm} (i=1,..,4;j=1,..,4;r=1,..,5;k=1,..,n_{ij(r)})
+$$
+
+In the above notation we use, $\mu_{(r)}$ ($r \in \{1,2,..,5\}$) denotes the random intercept corresponding to the $r^{th}$ session; $\alpha_{i}$ ($i \in \{1,2,3,4\}$) denotes the $i^{th}$ left contrast; $\beta_{j}$ ($j \in \{1,2,3,4\}$) denotes the $j^{th}$ right contrast. $(\alpha\beta)_{ij}$ is used to denote the corresponding interaction between left and right contrast. It then follows that $Y_{ijk(r)}$ represents the $k^{th}$ trial of the combination of $i^{th}$ left contrast and $j^{th}$ right contrast in the $r^{th}$ session ($n_{ij(r)}$ is the corresponding sample size). At last, $\epsilon_{ijk}$ is used to capture the random variability. We also have that $\mu_{(r)} \overset{i.id}{\sim}N(\mu,\sigma^2_\mu)$ and $\epsilon_{ijk} \overset{i.id}{\sim}N(0,\sigma^2)$. The model is restricted by the following linear constraints:
+
+$$
+\begin{aligned}
+&\sum_{i=1}^4 \sum_{j=1}^4 n_{ij(r)} \alpha_i = \sum_{i=1}^4 \sum_{j=1}^4 n_{ij(r)} \beta_j =0 \hspace{0.2cm}\text{for all }r\\
+&\sum_{i=1}^4 n_{ij(r)} (\alpha\beta)_{ij(r)} = \sum_{j=1}^4 n_{ij(r)} (\alpha\beta)_{ij(r)}=0 \hspace{0.2cm}\text{for all }r
+\end{aligned}
+$$
+
+### Assumption & Estimation
+
+
+To make valid inference based on the model and carry on hypothesis tests, we propose several assumptions. Firstly, we assume that each trial is independent from others. For any contrast level or session ID, knowing the outcome of one trial does not give any information about the outcome of others. Secondly, we assume that both the random intercept and residuals have constant variance. On top of that, we also assume that both the random intercept and residuals are normally distributed. Combining all assumptions, we have $Y_{ijk(r)} \overset{i.id}{\sim} N(\tilde\mu, \sigma^2+\sigma^2_{\mu})$ where $\tilde\mu = \mu + \alpha_i+\beta_j+(\alpha\beta)_{ij}$.
+
+To calculate the model coefficients under unbalanced design, we use the method of restricted maximum likelihood (ReML), which generates unbiased estimates for unknown variances ($\sigma^2$ and $\sigma_{\mu}^2$). In order to carry out hypothesis testing (LRT), we replace the ReML estimates with MLE. Asymptotically, the ReML and maximum likelihood estimators are equivalent (Richardson & Welsh, 1994). 
+
+
+```{r}
+# model
+options(contrasts = c("contr.treatment", "contr.poly"))
+
+mod1 <- lmerTest::lmer(mean_spk ~ contrast_left + contrast_right + contrast_left:contrast_right + (1|id), data =raw.data)
+# anova(mod1)
+
+mod0 <- lm(mean_spk ~ contrast_left * contrast_right, data=raw.data)
+
+# summary(mod1)
+
+# lines(smooth.spline(fitted.values(mod1), residuals(mod1)))
+```
+
+
+
+### Hypothesis Test
+
+#### Fixed Effects
+
+We first conduct two-sided F-tests to see whether main effects of left and right contrast as well as the interaction effects are significantly non-zero. Specifically, with the existence of interaction, we use type-III ANOVA. Due to random intercept, Satterthwaite's method was used to approximate the degrees of freedom. The proposed hypothesis and the corresponding test results are shown below.
+
+$$
+\begin{aligned}
+&(1) \hspace{0.1cm} H_0: \alpha_i=0 \text{ for all }i \hspace{0.3cm}H_a: \alpha_i \neq 0 \text{ for some }i\\
+&(2) \hspace{0.1cm} H_0: \beta_j=0 \text{ for all }j \hspace{0.3cm}H_a: \beta_j \neq 0 \text{ for some }j\\
+&(3) \hspace{0.1cm} H_0: (\alpha\beta)_{ij}=0 \text{ for all }i,j \hspace{0.3cm}H_a: (\alpha\beta)_{ij} \neq 0 \text{ for some }i,j\\
+\end{aligned}
+$$
+
+
+<table style="border-collapse:collapse;border-color:#aaa;border-spacing:0;margin:0px auto" class="tg"><thead><tr><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:normal;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Test</span></th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:normal;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">d.f. (num.)</span></th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">d.f. (denom.)</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:normal;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">F</span></th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:normal;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Pr(&gt;F)</span></th></tr></thead><tbody><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">(1)</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">4</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">10.1</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">13.44</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">(2)</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">3</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1176</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">10.87</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">(3)</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">9</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1176</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1.94</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.043</td></tr></tbody></table>
+
+At significance level $\alpha=0.05$, we reject the null in test (1), (2) and (3). For (1), our conclusion is that, with the presence of interaction and main effects from right contrast, the main effect from left contrast is significantly non-zero. For (2), we conclude that, with the presence of interaction and main effects from left contrast, the main effect from right contrast is likewise significantly non-zero. Finally, we conclude that even when both main effects are present, the interaction effect is still significant.
+
+#### Random Effects
+
+We further investigate whether random effect indeed exists across different sessions. Specifically, we conduct likelihood ratio test (LRT) based on two models: the full model that includes random intercept and a reduced model that does not include random intercept; the remaining terms are shared (main effects and interactions). Denoting $\gamma_{(r)}$ as the random effect of session ID, then the reduced model has a fixed intercept $\mu$ and the full model has a random intercept $\mu_{(r)}=\mu + \gamma_{(r)}$. Thus, the two models are nested, and the test has a degree of freedom of 1. LRT relies on the limiting distribution of likelihood ratio (i.e. $LR^* \overset{D}{\sim}\chi^2_{df=1}$), which relies on the asymptotic normality of MLE. Thus, we use MLE (instead of ReML) to generate model estimates before conducting the test. We propose the following test, and provide with the corresponding result as below.
+
+$$
+\begin{aligned}
+(4) \hspace{0.1cm} H_0: \sigma^2_{\mu} = 0 \hspace{0.3cm}H_a: \sigma^2_{\mu} \neq 0\\
+\end{aligned}
+$$
+<table style="border-collapse:collapse;border-color:#aaa;border-spacing:0;margin:0px auto" class="tg"><thead><tr><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Intercept</span></th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Deviance</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">d.f.</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Chisq</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Pr(&gt;Chisq)</span></th></tr></thead><tbody><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Fixed</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">3753.6</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">17</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></td></tr><tr><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Random</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">2313.8</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">18</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1439.8</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr></tbody></table>
+
+Based on the likelihood ratio test on the two nested models, we reject the null at $\alpha=0.05$ and conclude that there is significant variation that is due to random sampling of sessions. We therefore decide to keep the random intercept in our final model.
+
+### Model Estimates
+
+At last, we report the model estimates for our final model. The ReML-estimated coefficients are shown as below. Specifically, the estimates represent the difference in mean firing rate per second. We use the case when contrast is 0 as our baseline and report the pairwise comparisons in group means at different contrast levels. The two-sided t-test are also reported. Our conclusion is that there is significant difference in the mean firing rate between all non-zero contrast levels and zero contrast, except for the left contrast at 0.25.
+
+<table style="border-collapse:collapse;border-color:#aaa;border-spacing:0;margin:0px auto" class="tg"><thead><tr><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Comparison</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Estimate</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">t</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Pr(&gt;|t|)</th></tr></thead><tbody><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$L0.25 - L0$</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.12</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1.06</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.288</td></tr><tr><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$L0.5 - L0$</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.33</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">4.23</td><td style="background-color:#fff;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$L1 - L0$</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.42</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">5.26</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$R0.25 - R0$</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.33</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">3.42</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$R0.5 - R0$</td><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.31</td><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">4.00</td><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">$R1 - R0$</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.48</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">7.21</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr></tbody></table>
+
+```{r, eval=FALSE}
+summary(lmerTest::lmer(mean_spk ~ 0+contrast_right+contrast_left + contrast_left:contrast_right + (1|id), data =raw.data))
+
+summary(lmerTest::lmer(mean_spk ~ 0+contrast_left+contrast_right + contrast_left:contrast_right + (1|id), data =raw.data))
+```
+
+# Sensitivity Analysis
+
+### Model Diagnostic
+
+```{r}
+# anova(mod1, mod0)
+# summary(mod1)
+```
+
+```{r, fig.width=8}
+plot(fitted.values(mod1), residuals(mod1), col=rgb(red = 0, green = 0, blue = 0, alpha = 0.3), pch=20,
+     xlab="Fitted Values", ylab="Residuals", main="Fig A1: Residuals vs Fitted-Values")
+lines(smooth.spline(fitted.values(mod1), residuals(mod1), spar=0.9), col=2, lwd=2)
+abline(h=0, lwd=1.5, col=rgb(red = 0, green = 0, blue = 0, alpha = 0.8))
+
+par(mfrow=c(1,2))
+norm.sample = rnorm(10000)
+st.res = (residuals(mod1))/sd(residuals(mod1))
+norm.curve = density(norm.sample, bw=0.3)
+res.curve = density(st.res, bw=0.3)
+hist(st.res, freq = FALSE, breaks=20, xlab="Z-score", main="Fig A2.1: Studentized Residual Histogram")
+lines(res.curve, col=1, lwd=2)
+lines(norm.curve, col=2, lwd=2)
+legend("right", c("Studentized Residual", "Standard Normal"), lwd=c(2,2), col=c(1,2), cex=0.5)
+
+nr = length(residuals(mod1))
+reg.line = lm(sort(rnorm(nr))~sort(st.res))
+plot(sort(rnorm(nr)), sort(st.res), col=rgb(red = 0, green = 0, blue = 0, alpha = 0.3), pch=20,
+     xlab="Stdandard Normal Quantile", ylab="Stdudentized Residual Quantile", main="Fig A2.2: Normal Q-Q Plot")
+abline(reg.line,lty=2, lwd=1.5)
+abline(a=0,b=1, col=2, lwd=1.5)
+
+```
+```{r, fig.width=8}
+Y = fitted.values(mod1)
+Y.std = Y/sd(Y)
+Y.curve = density(Y.std, bw=0.3)
+
+hist(Y.std, freq = FALSE, breaks=20, xlab="Z-score", main="Fig A3: Scaled Fitted Value Histogram")
+lines(Y.curve, col=1, lwd=2)
+
+
+
+```
+
+From Fig A1, we observe no lack-of-fit. Residuals do not exhibit any systematic pattern, and are all centered around 0. We may also conclude that the constant variance assumption holds reasonably well based on the plot. Furthermore, the normality assumption for residuals is checked by the histogram of residuals (Fig A2.1) as well as the Normal Q-Q plot (Fig A2.2). The smoothed residual density curve on top of the histogram fits fairly close to the true normality. Also, the fitted regression line (dashed) nearly overlaps with the diagonal line (red) in the Q-Q plot. We therefore conclude that the normality assumption also holds well for the residuals. Lastly, we checked for the normality assumption for our random intercept (Fig A3). After taking out the residuals, our data follows a bimodal-shaped distribution, which is likely a result of the difference between the two experimental subjects. We therefore conclude that the normality assumption fail to hold for the random intercept component. Thus, our test result in (4) is unreliable and should not be considered.
+
+### Alternative Measure
+
+There is one particular concern about using mean firing rate across all neurons. If our aforementioned assumption (at the beginning of descriptive analysis section) about the neurons' behaviors fails to hold, using mean firing rate would take into account some subset of neurons that are indifferent to the visual stimuli. As a result, our conclusions may be inaccurate and our estimates about the effect of different contrast levels may be overly conservative. In fact, we may visually examine, for example, the overall behavior of the neurons in each session.
+
+
+```{r,fig.width=10, fig.height=6}
+par(mfrow=c(2,2))
+for (i in 1:4){
+  ni = length(session[[i]]$contrast_left)
+  neuro.count = dim(session[[i]]$spks[[1]])[1]
+  neuro.mean.i = rep(0, neuro.count)
+  # neuro.mean.i2 = rep(0, neuro.count)
+  # neuro.mean.i3 = rep(0, neuro.count)
+  mat.sum1 = matrix(rep(0, neuro.count*ni), nrow=neuro.count)
+  # mat.sum2 = matrix(rep(0, neuro.count*ni), nrow=neuro.count)
+  # mat.sum = matrix(rep(0, neuro.count*ni), nrow=neuro.count)
+
+  
+  for (j in 1:ni){
+    spk.mat = session[[i]]$spks[[j]]
+  
+    neuro.mean.i = neuro.mean.i + rowSums(spk.mat)/ni
+    mat.sum1[,j] = rowSums(spk.mat)
+
+    
+    # if (session[[i]]$feedback_type[j] == 1){
+    #   neuro.mean.i2 = neuro.mean.i2 + rowSums(spk.mat)/ni
+    #   mat.sum2[,j] = rowSums(spk.mat)
+    # }
+    # mat.sum[,j] = rowSums(spk.mat)
+    
+  }
+  # neuro.mean.i3 = neuro.mean.i3 / apply(mat.sum,1,sd)
+  # print(sum(na.omit(neuro.mean.i)))
+  # print(sum(na.omit(neuro.mean.i2)))
+  # print(sum(is.na(neuro.mean.i)))
+  # print(sum(is.na(neuro.mean.i2)))
+  
+  # print(sum(na.omit(neuro.mean.i3)))
+  # print(sum(is.na(neuro.mean.i3)))
+  
+  # par(mfrow=c(1,2))
+  plot(c(1:neuro.count), neuro.mean.i, type="h", main=paste("Fig: Session",i),
+       xlab="Neuron ID", ylab="Mean Firing Rate")
+  abline(h=median(neuro.mean.i), col=2)
+  abline(h=mean(neuro.mean.i), col=3)
+  legend("topright", c("Mean","Median"), lwd=c(1,1), col=c(3,2))
+  # text(c(1:neuro.count), neuro.mean.i - neuro.mean.i2, cex=0.5)
+  # 
+  # plot(c(1:neuro.count), neuro.mean.i)
+  # text(c(1:neuro.count), neuro.mean.i, cex=0/5)
+  
+
+  
+}
+```
+
+The plots above shows the mean firing rate for neurons in the first 4 sessions. The green and red line represents the mean and median of the mean firing rate across all neurons in each session. It suggests that sample median may be even more sensitive to the behavior of inactive neurons than mean. Also, the plots underscore the existence of a considerable proportion of neurons that are very inactive, as their medians are all almost 0. Thus, using mean firing rate across all neurons may not be an ideal approach. To reasonably mitigate the impact of inactive neurons to our inference, we explored one possible alternative. Specifically, we directly target at those inactive neurons and consider modeling neural activity based on mean firing rate of only the first 50% of neurons that are the most active. We re-fit the model and conduct a new round of F-test (type-III ANOVA) to see if our conclusion about the main effects and interactions change.
+
+
+<table style="border-collapse:collapse;border-color:#aaa;border-spacing:0;margin:0px auto" class="tg"><thead><tr><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Source of Effect</span></th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">F</th><th style="background-color:#f38630;border-color:#000000;border-style:solid;border-width:1px;color:#fff;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"><span style="font-weight:bold">Pr(&gt;F)</span></th></tr></thead><tbody><tr><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Left Contrast</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">6.7</td><td style="background-color:#FCFBE3;border-color:#000000;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Right Contrast</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">7.1</td><td style="background-color:#fff;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">&lt;0.001</td></tr><tr><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Interaction</td><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1.8</td><td style="background-color:#FCFBE3;border-color:#aaa;border-style:solid;border-width:1px;color:#333;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">0.064</td></tr></tbody></table>
+
+```{r, eval=FALSE}
+normalize = function(spks){
+  stdize = function(vec){
+  vec = vec
+  sd = sd(vec)
+  mean = mean(vec)
+  if (sd==0){
+    return(vec)
+  }
+  else{
+    return((vec-mean)/sd)
+  }
+}
+  n.neuro = dim(spks[[1]])[1]
+  n = length(spks)
+  full.matrix = matrix(rep(0, n.neuro*n), nrow=n.neuro)
+  for (i in n){
+    spk.mat.i = spks[[i]]
+    full.matrix[,i] = rowSums(spk.mat.i)/0.4
+  }
+  full.matrix = apply(full.matrix,1,stdize)
+  return(rowSums(full.matrix))
+}
+
+# remove some percentage of the neurons that are least active
+partial.mean = function(matrix, perc=0.5){
+  # calculate the mean fr for each neuron
+  neuron.mean.vec = colSums(matrix)/0.4
+  # take out a percentage of least active neurons
+  threshold = quantile(neuron.mean.vec, probs=0.5)
+  active.neuron.mean.vec = neuron.mean.vec[which(neuron.mean.vec>= threshold)]
+  return(mean(active.neuron.mean.vec))
+}
+
+raw.data2 = data.frame()
+for (id in 1:5){
+  session.data2 = session[[id]]
+  # session.data2$mean_spk = normalize(session[[id]]$spks)
+  session.data2$mean_spk = sapply(session[[id]]$spks, partial.mean)
+  session.data2 = data.frame(session.data2[c("contrast_left", "contrast_right","mouse_name","date_exp","mean_spk")])
+  session.data2$id = id
+  raw.data2 = rbind(raw.data2, session.data2)
+}
+
+# convert to factor
+raw.data2$contrast_left = as.factor(raw.data2$contrast_left)
+raw.data2$contrast_right = as.factor(raw.data2$contrast_right)
+raw.data2$id = as.factor(raw.data2$id)
+
+mod3 <- lmerTest::lmer(mean_spk ~ contrast_left * contrast_right + (1|id), data =raw.data2)
+# anova(mod3)
+```
+
+
+Based on the table above, left and right contrasts still have significant effects. The interaction term becomes not significant at $\alpha=0.05$. In other words, the potential existence of interaction we observe during the descriptive analysis may have been a result of those less active neurons.
+
+
+# Prediction
+
+At last, we propose a method for predicting whether the mouse in each trial will give correct response to the visual stimuli. We consider using a series of covariates, including mean firing rate (across all neurons), left contrast, right contrast, difference in contrast levels, mean firing rate at 9 pre-specified, evenly spaced time grids. We use logistic regression and decision tree as our candidate binary classifier. The model performance are reported below. Specifically, we find that our model has very high specificity but very low sensitivity. The neuron's activity may be good at predicting false outcomes, but not very good at predicting correct outcomes.
+
+#### Logistic Regression
+
+
+```{r}
+time.section = function(id, at=c(1,5,10,15,20,25,30,35,39)){
+  n=length(session[[id]]$feedback_type)
+  result.mat = rep(0, length(at))
+  for (i in 1:n){
+    matrix = session[[id]]$spks[[i]]
+    r.means = rowMeans(matrix)
+    r.means = r.means[at]
+    result.mat = rbind(result.mat, r.means)
+  }
+  
+  return(result.mat[2:(n+1),])
+}
+pred.data = data.frame()
+for (id in 1:3){
+  session.data.pred = session[[id]]
+  # session.data2$mean_spk = normalize(session[[id]]$spks)
+  session.data.pred$mean_spk = sapply(session[[id]]$spks, mean)
+  session.data.pred$sd_spk = sapply(session[[id]]$spks, sd)
+  session.data.pred = data.frame(session.data.pred[c("contrast_left", "contrast_right","mean_spk","feedback_type")])
+  session.data.pred$contrast_diff = abs(session.data.pred$contrast_left -  session.data.pred$contrast_right)
+  session.data.pred$id = id
+
+  
+  
+  time.section.matrix = time.section(id)
+  session.data.pred$s1 = time.section.matrix[,1]
+  session.data.pred$s2 = time.section.matrix[,2]
+  session.data.pred$s3 = time.section.matrix[,3]
+  session.data.pred$s4 = time.section.matrix[,4]
+  session.data.pred$s5 = time.section.matrix[,5]
+  session.data.pred$s6 = time.section.matrix[,6]
+  session.data.pred$s7 = time.section.matrix[,7]
+  session.data.pred$s8 = time.section.matrix[,8]
+  session.data.pred$s9 = time.section.matrix[,9]
+  
+  pred.data = rbind(pred.data, session.data.pred)
+}
+
+# convert to factor
+pred.data$contrast_left = as.factor(pred.data$contrast_left)
+pred.data$contrast_right = as.factor(pred.data$contrast_right)
+pred.data$feedback_type = recode_factor(pred.data$feedback_type, '-1' = 0, 
+                                '1' = 1)
+```
+
+```{r}
+train.set = pred.data[which(pred.data$id!=1),]
+train.set2 = train.set[,!(names(train.set) %in% c('id','feedback_type'))]
+
+
+test.set = pred.data[which(pred.data$id==1),][c(1:100),]
+test.set2 = test.set[,!(names(test.set) %in% c('id','feedback_type'))]
+
+
+# logistic regression
+glm.logistic = glm(feedback_type ~ . - id, data=train.set, family = binomial())
+pred.mod1 = step(glm.logistic, direction="both", trace=0)
+
+test_prob = predict(pred.mod1, newdata = test.set, type = "response")
+test_outcome = ifelse(test_prob > 0.5, yes=1, no=0)
+test_roc = roc(test.set$feedback_type ~ test_prob, plot = TRUE, print.auc = TRUE)
+# table(test_outcome, test.set$feedback_type)
+```
+
+
+<table style="border-collapse:collapse;border-spacing:0;border:none;margin:0px auto" class="tg"><thead><tr><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></th><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">True: 1</th><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">True: 0</th></tr></thead><tbody><tr><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Predicted: 1</td><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">1</td><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">5</td></tr><tr><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Predicted: 0</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">25</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">69</td></tr><tr><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Sensitivity:<br>0.04</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Specificity:<br>0.93</td></tr></tbody></table>
+
+
+#### Decision Tree
+```{r}
+# decision tree
+pred.mod3 <- rpart(feedback_type~. -id, data = train.set, method = 'class')
+predicted = predict(pred.mod3, test.set, type = 'class')
+# table(predicted, test.set$feedback_type)
+```
+
+<table style="border-collapse:collapse;border-spacing:0;border:none;margin:0px auto" class="tg"><thead><tr><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></th><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">True: 1</th><th style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">True: 0</th></tr></thead><tbody><tr><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Predicted: 1</td><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">14</td><td style="border-color:#000000;border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">14</td></tr><tr><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Predicted: 0</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">12</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">60</td></tr><tr><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;font-weight:bold;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal"></td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Sensitivity:<br>0.46</td><td style="border-style:solid;border-width:0px;font-family:Arial, sans-serif;font-size:14px;overflow:hidden;padding:10px 5px;text-align:center;vertical-align:top;word-break:normal">Specificity:<br>0.81</td></tr></tbody></table>
+
+
+
+# Conclusion & Discussion
+
+To begin with, we verify with 2-way ANOVA mixed effect models that the left and right contrast do trigger significant changes in mouses' neural activity in the visual cortex, as measured by mean firing rate. If we assume that all neurons will respond to the changes in visual stimuli, then by tesing for the interaction effect using mean firing rate across all neurons, we can conclude that the effects of left and right contrasts are non-additive (i.e. interaction is significant). In case the assumption is invalid, we then proposed an alternative approach to mitigate the effect of less active neurons. With teh proposed method, we find that, at $\alpha=0.05$, the effect of left and right contrast becomes additive, which implies the possible disturbing effect of inactive neurons.
+
+Our analysis also has one potential pitfall. That is, we cannot rule out the potential impact of dependency for trials within each session. As repeated measurement was involved, the mouse's behavior and neurons' activity may have time-dependency, which is assumed to be weak and negligable in this project. At least, we are able to say that, because residuals are uncorrelated with fitted values and that normality assumption holds, we may induce independence. Nevertheless, it would be safer to conduct further analysis on this. Time-series analysis is one plausible approach if the time at which each trial was conducted is known.
+
+In terms of the random effect, because of the violation of normality assumption of the random intercept, we cannot rely directly on the F-test result. Still, at least based on visual examination, we see clear difference in the mean firing rate across different subjects. In addition, we also observed a suspicious decline in the overall level of mean firing rate when time progresses, which holds for both mice. It may be interesting to conduct further investigation on the underlying reason of such random variation.
+
+At last, it is also worth the attention that, because the sensors were placed in the left hemisphere, whether or not left and right sidedness of the contrast could be influenced by the location of sensor remains unknown. In descripative analysis section, we can observe that, for instance, the high level in neurons' mean firing rate when right contrast is 1 is more prominent; whereas when left contrast is 1, such pattern does not exist. Further investigation on the sided-ness of the visual cortex may also be rewarding.
+
+
+
+
+# Reference
+
+[1] RICHARDSON, A. M., &amp; WELSH, A. H. (1994). Asymptotic properties of Restricted Maximum Likelihood (REML) estimates for hierarchical mixed linear models. Australian Journal of Statistics, 36(1), 31–43. https://doi.org/10.1111/j.1467-842x.1994.tb00636.x 
+ 
+[2] Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
